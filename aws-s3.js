@@ -1,0 +1,525 @@
+/* bucket is a quick and dirty, deferred callback s3 library
+ *
+ * example require
+ * var bucket = require('bucket').init(TOKEN, SECRET, BUCKET);
+ *
+ * example get
+ * bucket().get("user_details.json").success(func(user) { console.log(user.name); }));
+ * example put
+ * bucket().put("user_details.json", {name: "Alex Bosworth"})
+ *
+ * Set up the callbacks you want by chaining functions off the bucket object.
+ *
+ * bucket().get(key)
+ * .complete(func(){}) < fires immediately and includes err, response, [responseData]
+ * .success(func(){}) < if there is no failure, returns [responseData (cleaned)]
+ * .failure(func(){}) < any failure returns err here.
+ * .finished(func(){}) < fires after everything else.
+ *
+ * example put
+ * bucket().put(objectName, data, [options])
+ *
+ * options can include <headers> <meta> <binaryBuffer> <acl> <readStream> 
+ */
+
+var crypto = require('crypto'),
+    http = require('http'),
+    xml2js = require('xml2js');
+    queryStringify = require('querystring').stringify;
+    
+function xmlParse(xmlString, cbk) {
+    var xmlParser = new xml2js.Parser();
+	
+	xmlParser.on('end', function(result) { cbk(result); })
+
+	xmlParser.parseString(xmlString); 			    				    
+}
+
+// returns a new bucket object based on the init keys
+function init(key, pass, bucket, options) {
+    options = options || {};
+    
+    return function createInstance(newBucket, newOptions) {
+        return new S3(key, pass, newBucket || bucket, newOptions || options);
+    };
+}
+
+function S3(key, pass, bucket, options) {
+    this._key = key;
+    this._pass = pass;
+    this._bucket = bucket;
+    
+    this._acl = options.acl || 'private';
+    this._storageType = options.storageType || 'STANDARD';
+    
+    this._successCbk = new Function();
+    this._failureCbk = new Function();
+    this._completeCbk = new Function(); // this is immediate, before success or failure
+    this._finishedCbk = new Function(); // this is the final thing that happens
+    
+    return this;
+}
+
+S3.prototype.head = function(key) {
+    var self = this;
+    
+    self._request('HEAD', key, function headResponse(err, response) {
+        self._completeCbk(err, response);
+                
+        if (err) return self.failed(err);
+        if (response.statusCode != 200) return self.failed(response.statusCode);
+        
+        var meta = {};
+        
+        for (var header in response.headers) {
+            if (header.substring(0, 10) != 'x-amz-meta') continue;
+            
+            meta[header.substring(11)] = response.headers[header];
+        }
+        
+        self._successCbk(response.headers, meta);
+        
+        self._finishedCbk();
+    });
+    
+    return this;
+}
+
+S3.prototype.del = function(key) { 
+    var self = this;
+    
+    self._request('DELETE', key, function delResponse(err, response, responseData) {
+        self._completeCbk(err, response, responseData);
+        
+        if (err) return self.failed(err);
+        
+        self._successCbk();
+        
+        self._finishedCbk();
+    });
+    
+    return this;
+};
+
+// use bucket().get(key).success(function(data) { });
+// success: returns object if JSON, string otherwise.
+S3.prototype.get = function(key) {
+    var self = this;
+        
+    self._request('GET', key, function getResponse(err, response, responseData) {
+        self._completeCbk(err, response, responseData);
+        
+        if (err) return self.failed(err); 
+        if (response.statusCode != 200) return self.failed(responseData);        
+        
+        if (/application.json/.test(response.headers['content-type'])) {
+            try {
+                responseData = JSON.parse(responseData);
+            }
+            catch (e) {
+                // wasn't parseable
+            }
+        }
+        
+        self._successCbk(responseData);
+        
+        self._finishedCbk();
+    });
+    
+    return this;
+};
+
+// use bucket().list('dirname/', '/', 500)
+S3.prototype.list = function(prefix, delimiter, count) {
+    var self = this,
+        results = [];
+    
+    var args = {
+        prefix: prefix || '',
+        delimiter: delimiter || '',
+        'max-keys': count || 1000
+    };
+        
+    var list = function() {                
+        self._request('GET', '', {}, args, function listResponse(err, response, data) {
+            self._completeCbk(err, response, data);
+                
+            if (response.statusCode != 200) err = data;
+        
+            if (err) return self.failed(err);
+            
+            xmlParse(data, function parsedListResponse(xml) {
+                var prefixes = xml.CommonPrefixes || [],
+    				contents = xml.Contents || [];
+    				
+                if (!prefixes.forEach) prefixes = [];
+    				
+    			prefixes.forEach(function(dir) {
+    				results.push({
+    					type: 'dir',
+    					name: dir.Prefix
+    				});
+    			});
+    			
+    			if (contents.Key) contents = [contents]; // boo xml
+			
+    			contents.forEach(function(file) {    			    
+    				results.push({
+    					type: 'file',
+    					key: file.Key,
+    					lastModified: new Date(file.LastModified),
+    					size: parseInt(file.Size),
+    				});
+    				
+    				args['max-keys']--;
+    		    });
+    		        		        		    
+    		    if (xml.IsTruncated != 'true') {
+    		        self._successCbk(results);
+    		        
+    		        return self._finishedCbk();
+		        }
+		            		                    
+                if (contents.length) args.marker = contents[contents.length - 1].Key;
+                
+                if (args.marker && args.marker != 'undefined') list();
+            });
+        });        
+    };
+    
+    list();
+    
+    return this;
+}
+
+S3.prototype._streamingPut = function(key, stream, headers) {
+    var self = this,
+        parts = {},
+        uploadId,
+        headers = headers || {},
+        partNumber = 1,
+        paused = false;
+        
+    var pauseStream = function() { 
+        paused = true; 
+        stream.pause(); 
+    };
+    
+    var resumeStream = function() { 
+        if (!paused) return; 
+        
+        paused = false; 
+        
+        stream.resume(); 
+    };
+    
+    var numCurrentlyUploading = function() {
+        var count = 0;
+
+        for (var part in parts) if (!parts[part]) count++;
+
+        return count;
+    };
+        
+    pauseStream();
+            
+    self._request('POST', key + '?uploads', headers, function(err, response, data) {
+        uploadId = data.match(/UploadId.(.*)..UploadId/)[1],
+        finishUpload = false; // signals ends of the stream
+                
+        resumeStream();
+        
+        var uploadPart = new Buffer(5251337),
+            writtenLength = 0;
+        
+        stream.on('data', function(chunk) {
+            var offset = 0; // where to split a chunk if necessary
+                
+            if (writtenLength + chunk.length > uploadPart.length) {                
+                // create a copy of the uploadBuffer that can get flushed to S3
+                var flushBuffer = new Buffer(uploadPart.length);
+                
+                uploadPart.copy(flushBuffer);
+                
+                // the chunk must be split in twain
+                offset = flushBuffer.length - writtenLength;
+                
+                chunk.copy(flushBuffer, writtenLength, 0, offset + 1);
+
+                flushUploadPart(partNumber, flushBuffer); // send to S3
+                
+                // reset to start
+                partNumber++;
+                uploadPart = new Buffer(uploadPart.length);
+                writtenLength = 0;
+            }
+            
+            chunk.copy(uploadPart, writtenLength, offset);
+            
+            writtenLength+= (chunk.length - offset);
+            
+            if (numCurrentlyUploading() > 10) pauseStream();
+        });
+        
+        var flushUploadPart = function(partNum, part) {
+            var md5Hash = crypto.createHash('md5');            
+            
+            parts[partNum] = false; // signals part is not completely uploaded
+                        
+            var args = {
+                partNumber: partNum,
+                uploadId: uploadId };
+            
+            var reqHeaders = {
+                'Content-MD5': md5Hash.update(part).digest('base64'),
+                'Content-Length': part.length };
+                            
+            self._request('PUT', key + '?' + queryStringify(args), reqHeaders, part,
+            function completePartUpload(err, response) {
+                if (err) return self.failed(err);
+                
+                parts[partNum] = response.headers.etag;
+                
+                if (numCurrentlyUploading() < 10) resumeStream();
+                                
+                if (!finishUpload) return;
+                
+                // check all the parts for etags, this means they are complete
+                for (var part in parts) if (!parts[part]) return;
+                
+                self._completeMultipartUpload(key, uploadId, parts);
+            });
+        };
+                
+        stream.on('end', function() { 
+            flushUploadPart(partNumber, uploadPart.slice(0, writtenLength));            
+            
+            finishUpload = true;
+        });
+    });    
+    
+    return self;
+}
+
+S3.prototype._completeMultipartUpload = function(key, uploadId, parts) {
+    var self = this,
+        xml = '<CompleteMultipartUpload>';
+        
+    uploadId = encodeURIComponent(uploadId);
+    
+    for (var part in parts) { 
+        xml+= '<Part>' +
+            '<PartNumber>' + part + '</PartNumber>' +
+            '<ETag>' + parts[part] + '</ETag>' + 
+            '</Part>';
+    }
+    
+    xml = new Buffer(xml + '</CompleteMultipartUpload>', 'binary');
+    
+    var reqHeaders = {
+        'Content-Length': xml.length
+    };
+    
+    self._request('POST', key + '?uploadId=' + uploadId, reqHeaders, xml, 
+    function completeMultipartUploadResponse(err, response, data) {
+        self._completeCbk(err, response, data);
+        
+        if (err) return self.failed(err);
+        
+        self._successCbk();
+        
+        self._finishedCbk();
+    });
+};
+
+/* 
+    Put is very flexible:
+    bucket().put('test', 'hello world') will put hello world in file test
+    You can also do:
+    bucket().put('test', {foo: bar}) - will mark this as application/json, utf8
+    
+    options:
+    headers - default headers
+    meta - convenience for x-amz-meta headers
+    binaryBuffer - a node.js binary buffer
+    acl - public-read, etc. defaults to private
+    storageType - defaults to normal
+    readStream - a node.js readstream
+*/
+S3.prototype.put = function(key, data, options) {
+    var self = this,
+        options = options || {},
+        file = { data: data };
+            
+    file.headers = options.headers || {};
+    file.meta = options.meta || {};
+    file.buffer = options.binaryBuffer || data;
+    
+    for (var k in file.meta) file.headers['x-amz-meta-' + k] = file.meta[k];
+    
+    file.headers['x-amz-acl'] = options.acl || self._acl;
+	file.headers['x-amz-storage-class'] = options.storageType || self._storageType;
+	
+	if (options.readStream) return this._streamingPut(key, data, file.headers);
+    
+    if (options.binaryBuffer) {
+        file.buffer = data;
+    }
+    else if (typeof(data) == 'string') {
+        file.buffer = new Buffer(data, 'binary');
+    }
+    else {
+        file.buffer = new Buffer(JSON.stringify(data), 'utf8');
+        file.headers['Content-Type'] = "application/json; charset=utf-8;";
+    }	
+    
+    var md5Hash = crypto.createHash('md5');
+    	    
+    file.headers['Content-Length'] = file.buffer.length;
+	file.headers['Content-MD5'] = md5Hash.update(file.buffer).digest('base64');
+	
+    self._request('PUT', key, file.headers, file.buffer,     
+    function postResponseCbk(err, response, responseData) {        
+        self._completeCbk(err, response, responseData);
+        
+        if (err) return self.failed(err);
+                        
+        self._successCbk(response);
+        
+        self._finishedCbk();
+    });
+    
+    return this;
+}
+
+S3.prototype.success = function(cbk) {
+    this._successCbk = cbk;
+    
+    return this;
+};
+
+S3.prototype.failure = function(cbk) {
+    this._failureCbk = cbk;
+    
+    return this;
+};
+
+S3.prototype.complete = function(cbk) {
+    this._completeCbk = cbk;
+    
+    return this;
+};
+
+S3.prototype.finished = function(cbk) {
+    this._finishedCbk = cbk;
+    
+    return this;
+};
+
+S3.prototype.failed = function(err) {
+    this._failureCbk();
+    
+    this._finishedCbk();
+};
+
+S3.prototype._getCanonicalizedAmzHeaders = function(headers) {
+	var canonicalizedHeaders = [];
+	
+    for (header in headers) {
+		// pull out amazon headers
+		if (/x-amz-/i.test(header)) {
+			var value = headers[header];
+			
+			if (value instanceof Array) {
+				value = value.join(',');
+			}
+			
+			canonicalizedHeaders.push(header.toString().toLowerCase() + ':' + value);
+		}
+	}
+	
+	var result = canonicalizedHeaders.sort().join('\n')
+	
+	if (result) {
+		result += '\n';
+	}
+	
+	return result;
+};
+
+S3.prototype._getAuthorizationHeader = function(headers, method, resource) {
+    var self = this,
+        canonicalizedAmzHeaders = this._getCanonicalizedAmzHeaders(headers);	
+        
+    resource = '/' + self._bucket + '/' + resource;
+					
+	var stringToSign = (function(headers, method, canonicalizedAmzHeaders, resource) {
+		var date = headers.Date || new Date().toUTCString();
+
+		//make sure we have a content type
+		var contentType = headers['Content-Type'] || '',
+		    md5 = headers['Content-MD5'] || '';
+
+		//return the string to sign.
+		return stringToSign = 
+			method + "\n" + 
+			md5 + "\n" +
+			contentType + "\n" +    	// (optional)
+			date + "\n" +				// only include if no x-amz-date
+			canonicalizedAmzHeaders +	// can be blank
+			resource;
+	})(headers, method, canonicalizedAmzHeaders, resource);
+	
+	var hmac = crypto.createHmac('sha1', self._pass); hmac.update(stringToSign);
+	
+	return 'AWS ' + self._key + ':' + hmac.digest('base64');
+};
+
+// <http verb> <resource path> <request headers> <request data> <cbk>
+// can skip the request data/headers and just put in a callback if there is no req stuff.
+S3.prototype._request = function(method, path, headers, data, cbk) {
+    var self = this;
+    
+    if (arguments.length == 3) { cbk = headers; headers = {}; }
+    if (arguments.length == 4) { cbk = data; data = null; } // these simplify the call proc 
+    
+    cbk = cbk || new Function();
+    
+    headers = headers || {};
+        
+    headers['Date'] = new Date().toUTCString(),
+    headers['Host'] = self._bucket + '.s3.amazonaws.com';
+    headers['Authorization'] = self._getAuthorizationHeader(headers, method, path);
+    
+    if (method == 'GET' && data) {
+        data = queryStringify(data); 
+        
+        path+= '?' + data;
+    }
+    
+    var req = http.request({
+        host: self._bucket + '.s3.amazonaws.com',
+        port: 80,
+        path: '/' + path,
+        headers: headers,
+        method: method
+    }, 
+    
+    function receivedResponse(res) {
+        var body = '';
+        
+        res.on('data', function(chunk) { body+= chunk; });        
+        
+        res.on('end', function() { cbk(null, res, body); })
+    }).
+    
+    on('error', function errorInS3Request(err) { cbk(err); });
+    
+    if (data && data.length) req.write(data);
+
+    req.end();
+};
+
+exports.init = init;
+
+exports.get = exports.put = function() { throw new Error('Use init first'); };
