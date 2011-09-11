@@ -1,0 +1,30 @@
+bucket is a library for working with amazon web service's s3 service
+
+bucket uses deferred callbacks, which means you can chain callbacks, or define them at later points, very easily.
+
+for example: bucket().get(filename).success(function(file) { console.log(file); });
+
+deferreds can be chained: .success(function() {}).failure(function() {}) etc
+
+if you don't care about failures, just don't set that callback
+
+success and failure are special helper callbacks. they try to be smart about what they return. 
+
+get a file with a json header - success will parse the json for you. bucket tries to give you just what you need
+
+bucket is oriented around the idea that you usually work within a single bucket, so it is designed for this case.
+
+var bucket = require('bucket').init(TOKEN, SECRET, BUCKET);
+
+example get
+bucket().get("user_details.json").success(func(user) { console.log(user.name); }));
+example put
+bucket().put("user_details.json", {name: "Alex Bosworth"})
+bucket().put(objectName, data, [{options}])
+options can include <headers> <meta> <binaryBuffer> <acl> <readStream> 
+
+deferreds:
+.complete(func(){}) < fires immediately and includes err, response, [responseData]
+.success(func(){}) < if there is no failure, returns [responseData (cleaned)]
+.failure(func(){}) < any failure returns err here.
+.finished(func(){}) < fires after everything else.
