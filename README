@@ -28,3 +28,5 @@ deferreds:
 .success(func(){}) < if there is no failure, returns [responseData (cleaned)]
 .failure(func(){}) < any failure returns err here.
 .finished(func(){}) < fires after everything else.
+
+bucket is licensed under the MIT License
