@@ -1,3 +1,7 @@
+clone, or install with npm: npm install bucket
+
+---
+
 bucket is a library for working with amazon web service's s3 service
 
 bucket uses deferred callbacks, which means you can chain callbacks, or define them at later points, very easily.
