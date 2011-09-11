@@ -20,6 +20,8 @@ bucket is oriented around the idea that you usually work within a single bucket,
 
 var bucket = require('bucket').init(TOKEN, SECRET, BUCKET);
 
+if you want more than one bucket or S3 account, just do var bucket = require('bucket'); var myBucket = bucket.init(), myBucket2 = bucket.init();
+
 example get
 bucket().get("user_details.json").success(func(user) { console.log(user.name); }));
 example put
